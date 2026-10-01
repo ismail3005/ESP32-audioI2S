@@ -6226,31 +6226,122 @@ uint32_t Audio::ogg_correctResumeFilePos(uint32_t resumeFilePos) {
     return 0;
 }
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// FLAC frame-header CRC-8 (format spec: polynomial x^8+x^2+x^1+x^0 = 0x07,
+// MSB-first, no reflection, initial value 0). The FLAC format defines this
+// byte specifically so a decoder/seeker can verify it has really landed on a
+// frame boundary before trusting it, as opposed to a 2-byte 0xFF/0xF8 match
+// that random compressed audio data hits by chance fairly often. See the
+// clickpod-3.0.12-flac-patch branch's history / clickpod's CLAUDE.md
+// (fourteenth hardware bug) for the real crash this was added to fix:
+// bitrate-estimate seeking on FLAC (setAudioPlayPosition()) lands at an
+// arbitrary byte offset almost every time, and without this check the old
+// implementation here accepted the FIRST syncword-looking 2 bytes it found,
+// no matter how often that happened to be a false positive inside frame
+// data -- which fed garbage frame headers into flacDecodeFrame() (reserved/
+// invalid field codes, an unbounded UTF-8-coded-number byte count with
+// nothing validating it against bytesLeft) and visibly corrupted decoder
+// state on every false accept.
+static uint8_t flacFrameHeaderCrc8(const uint8_t *data, int len) {
+    uint8_t crc = 0;
+    for(int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for(int b = 0; b < 8; b++) {
+            if(crc & 0x80) crc = (uint8_t)((crc << 1) ^ 0x07);
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+// Attempts to parse a complete, structurally valid FLAC frame header
+// starting at `pos` and verifies its CRC-8. Returns the header length in
+// bytes (sync word through the CRC-8 byte inclusive) if `pos` is a real
+// frame boundary, or -1 if it's a false positive (reserved/invalid field
+// value, truncated against maxPos, or CRC mismatch) -- in which case the
+// caller should keep scanning rather than trust this position. Reads
+// directly from `audiofile` and leaves the file position wherever it ends
+// up; callers must re-seek before relying on the file position afterward.
+// Deliberately self-contained (doesn't touch flac_decoder.cpp's state) so
+// it's safe to call speculatively on candidate positions that turn out to
+// be false, unlike actually running the real decoder against them.
+int32_t Audio::flac_tryParseFrameHeader(uint32_t pos, uint32_t maxPos) {
+    const int kMaxHeaderLen = 16; // 4 fixed + 7 UTF-8 max + 2 blocksize + 2 samplerate + 1 CRC
+    uint8_t   buf[kMaxHeaderLen];
+
+    if(pos + kMaxHeaderLen > maxPos) return -1; // keep it simple, don't special-case EOF truncation
+    audiofile.seek(pos);
+    for(int i = 0; i < kMaxHeaderLen; i++) buf[i] = audiofile.read();
+
+    if(buf[0] != 0xFF) return -1;
+    if((buf[1] & 0xFE) != 0xF8) return -1; // sync remainder + reserved bit(must be 0); blocking-strategy bit free
+
+    uint8_t blockSizeCode  = (buf[2] >> 4) & 0x0F;
+    uint8_t sampleRateCode = buf[2] & 0x0F;
+    uint8_t chanAsgn       = (buf[3] >> 4) & 0x0F;
+    uint8_t sampleSizeCode = (buf[3] >> 1) & 0x07;
+    uint8_t reserved2      = buf[3] & 0x01;
+
+    if(blockSizeCode == 0) return -1;               // reserved
+    if(sampleRateCode == 15) return -1;              // reserved
+    if(chanAsgn > 10) return -1;                      // 11-15 reserved
+    if(sampleSizeCode == 3 || sampleSizeCode == 7) return -1; // reserved
+    if(reserved2 != 0) return -1;
+
+    // Variable-length UTF-8-coded frame/sample number, starting at buf[4].
+    // Its own leading byte's high-bit run tells us how many bytes it spans
+    // (1-7) -- this is the exact field the old implementation let a false
+    // sync match drive an unvalidated skip-count from (see flacDecodeFrame()
+    // in flac_decoder.cpp); here every byte is checked to actually look like
+    // a UTF-8 lead/continuation byte, not just trusted blind.
+    uint8_t lead = buf[4];
+    int     utf8Len;
+    if((lead & 0x80) == 0x00) utf8Len = 1;
+    else if((lead & 0xE0) == 0xC0) utf8Len = 2;
+    else if((lead & 0xF0) == 0xE0) utf8Len = 3;
+    else if((lead & 0xF8) == 0xF0) utf8Len = 4;
+    else if((lead & 0xFC) == 0xF8) utf8Len = 5;
+    else if((lead & 0xFE) == 0xFC) utf8Len = 6;
+    else if(lead == 0xFE) utf8Len = 7;
+    else return -1; // 0xFF lead byte (or any other non-UTF8-shaped byte) is never valid here
+
+    for(int i = 1; i < utf8Len; i++) {
+        if((buf[4 + i] & 0xC0) != 0x80) return -1; // continuation bytes must be 10xxxxxx
+    }
+
+    int pLen = 4 + utf8Len; // bytes consumed so far
+    if(blockSizeCode == 6) pLen += 1;
+    else if(blockSizeCode == 7) pLen += 2;
+    if(sampleRateCode == 12) pLen += 1;
+    else if(sampleRateCode == 13 || sampleRateCode == 14) pLen += 2;
+
+    int headerLen = pLen + 1; // + the CRC-8 byte itself
+    if(headerLen > kMaxHeaderLen) return -1; // can't happen given the field ranges above, but stay safe
+
+    uint8_t expectedCrc = buf[pLen];
+    uint8_t actualCrc = flacFrameHeaderCrc8(buf, pLen);
+    if(expectedCrc != actualCrc) return -1;
+
+    return headerLen;
+}
+
 int32_t Audio::flac_correctResumeFilePos(uint32_t resumeFilePos) {
-    // The starting point is the next FLAC syncword
-    uint8_t  p1, p2;
-    boolean  found = false;
+    // The starting point is the next FLAC syncword that also parses as a
+    // structurally valid, CRC-8-verified frame header -- NOT just the first
+    // 2 bytes that happen to look like a syncword (false positives against
+    // compressed audio data are common enough to hit in practice, see
+    // flac_tryParseFrameHeader()'s comment above).
     uint32_t pos = resumeFilePos;
     uint32_t maxPos = m_audioDataStart + m_audioDataSize;
 
-    if(pos + 2 >= maxPos) goto exit;
-
-    audiofile.seek(pos);
-    p1 = audiofile.read();
-    p2 = audiofile.read();
-    pos += 2;
-    while(!found && pos < maxPos) {
-        if(p1 == 0xFF && p2 == 0xF8) {
-            found = true;
-            break;
+    while(pos + 1 < maxPos) {
+        audiofile.seek(pos);
+        uint8_t p1 = audiofile.read();
+        uint8_t p2 = audiofile.read();
+        if(p1 == 0xFF && (p2 & 0xFE) == 0xF8) {
+            if(flac_tryParseFrameHeader(pos, maxPos) >= 0) return pos;
         }
-        p1 = p2;
-        p2 = audiofile.read();
         pos++;
     }
-    if(found) return (pos - 2);
-
-exit:
     return -1;
 }
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
