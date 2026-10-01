@@ -218,6 +218,87 @@ void FLACDecoderReset(){ // set var to default
     FLACDecoder_ClearBuffer();
 }
 //----------------------------------------------------------------------------------------------------------------------
+// Same frame-header CRC-8 verification as Audio.cpp's
+// flac_tryParseFrameHeader() (see that function's comment for the full
+// writeup / clickpod CLAUDE.md's fourteenth hardware bug) -- a separate,
+// local copy here because this is a different translation unit and this
+// path works on an in-memory buffer slice (no file I/O), not an SD file.
+// Needed because a real-hardware crash showed this exact resync path
+// (entered any time flacDecodeFrame() hits a decode error mid-stream, NOT
+// just after a seek) accepting an unverified 2-byte 0xFF/0xF8 match and
+// feeding the resulting garbage header back into the decoder -- the same
+// false-positive-prone syncword match that justified fixing the seek path,
+// just reachable without ever seeking at all.
+static uint8_t flacFindSyncWordCrc8(const uint8_t *data, int len) {
+    uint8_t crc = 0;
+    for(int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for(int b = 0; b < 8; b++) {
+            if(crc & 0x80) crc = (uint8_t)((crc << 1) ^ 0x07);
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+// Returns the full header length (sync word through CRC-8 byte inclusive)
+// if buf[0..] parses as a structurally valid, CRC-8-verified FLAC frame
+// header, or -1 if it's a false positive or there isn't enough of the
+// buffer left (from `avail` bytes) to tell -- mirrors Audio::
+// flac_tryParseFrameHeader()'s field-by-field logic exactly, see that
+// function's comments for why each check exists. Doesn't touch any decoder
+// state, safe to call speculatively.
+static int32_t flacTryParseFrameHeader(const uint8_t *buf, int32_t avail) {
+    const int32_t kMaxHeaderLen = 16;
+    if(avail < kMaxHeaderLen) return -1;
+
+    if(buf[0] != 0xFF) return -1;
+    if((buf[1] & 0xFE) != 0xF8) return -1;
+
+    uint8_t blockSizeCode  = (buf[2] >> 4) & 0x0F;
+    uint8_t sampleRateCode = buf[2] & 0x0F;
+    uint8_t chanAsgn       = (buf[3] >> 4) & 0x0F;
+    uint8_t sampleSizeCode = (buf[3] >> 1) & 0x07;
+    uint8_t reserved2      = buf[3] & 0x01;
+
+    if(blockSizeCode == 0) return -1;
+    if(sampleRateCode == 15) return -1;
+    if(chanAsgn > 10) return -1;
+    if(sampleSizeCode == 3 || sampleSizeCode == 7) return -1;
+    if(reserved2 != 0) return -1;
+
+    uint8_t lead = buf[4];
+    int32_t utf8Len;
+    if((lead & 0x80) == 0x00) utf8Len = 1;
+    else if((lead & 0xE0) == 0xC0) utf8Len = 2;
+    else if((lead & 0xF0) == 0xE0) utf8Len = 3;
+    else if((lead & 0xF8) == 0xF0) utf8Len = 4;
+    else if((lead & 0xFC) == 0xF8) utf8Len = 5;
+    else if((lead & 0xFE) == 0xFC) utf8Len = 6;
+    else if(lead == 0xFE) utf8Len = 7;
+    else return -1;
+
+    for(int32_t i = 1; i < utf8Len; i++) {
+        if((buf[4 + i] & 0xC0) != 0x80) return -1;
+    }
+
+    int32_t pLen = 4 + utf8Len;
+    if(blockSizeCode == 6) pLen += 1;
+    else if(blockSizeCode == 7) pLen += 2;
+    if(sampleRateCode == 12) pLen += 1;
+    else if(sampleRateCode == 13 || sampleRateCode == 14) pLen += 2;
+
+    int32_t headerLen = pLen + 1;
+    if(headerLen > kMaxHeaderLen) return -1;
+    if(headerLen > avail) return -1;
+
+    uint8_t expectedCrc = buf[pLen];
+    uint8_t actualCrc = flacFindSyncWordCrc8(buf, pLen);
+    if(expectedCrc != actualCrc) return -1;
+
+    return headerLen;
+}
+
 int32_t FLACFindSyncWord(unsigned char *buf, int32_t nBytes) {
 
     int32_t i = FLAC_specialIndexOf(buf, "OggS", nBytes);
@@ -228,9 +309,12 @@ int32_t FLACFindSyncWord(unsigned char *buf, int32_t nBytes) {
         return i;
     }
     else{
-         /* find byte-aligned sync code - need 14 matching bits */
+         /* find byte-aligned sync code - need 14 matching bits, THEN verify
+            the frame header's CRC-8 before trusting it -- see the comment
+            above flacFindSyncWordCrc8()/flacTryParseFrameHeader() */
         for (i = 0; i < nBytes - 1; i++) {
             if ((buf[i + 0] & 0xFF) == 0xFF  && (buf[i + 1] & 0xFC) == 0xF8) { // <14> Sync code '11111111111110xx'
+                if(flacTryParseFrameHeader(buf + i, nBytes - i) < 0) continue; // false positive, keep scanning
                 if(i) FLACDecoderReset();
             //    s_f_bitReaderError = false;
                 return i;
