@@ -214,8 +214,48 @@ void FLACSetRawBlockParams(uint8_t Chans, uint32_t SampRate, uint8_t BPS, uint32
 }
 //----------------------------------------------------------------------------------------------------------------------
 void FLACDecoderReset(){ // set var to default
+    // FLACDecoder_ClearBuffer() memsets the WHOLE FLACMetadataBlock_t to 0,
+    // including numChannels/sampleRate/bitsPerSample -- but a FLAC frame's
+    // own header is allowed (and commonly does, for any file with constant
+    // parameters throughout, which is the normal case) to signal "use the
+    // file-level STREAMINFO value" via a 0 code for channel assignment/
+    // sample-rate/sample-size, relying on flacDecodeFrame() already having
+    // these cached from a PRIOR frame. Right after a reset -- which this
+    // function runs on every resync, not just a seek: FLACFindSyncWord()
+    // below calls it too, any time flacDecodeFrame() hits an ordinary
+    // mid-stream decode error -- there IS no prior frame, so those checks
+    // (`if(!FLACMetadataBlock->bitsPerSample) ...`) find 0 and fall
+    // through with nothing set, incorrectly raising ERR_FLAC_BITS_PER_
+    // SAMPLE_UNKNOWN / ERR_FLAC_UNKNOWN_CHANNEL_ASSIGNMENT on what's
+    // actually a perfectly valid frame. Confirmed on real hardware: after
+    // this fork's CRC-8 frame-header verification (see Audio.cpp's
+    // flac_tryParseFrameHeader() and this file's flacTryParseFrameHeader())
+    // already landed on a correctly-verified real frame header post-seek,
+    // decode STILL failed with exactly these two errors, repeatedly --
+    // proving the false-positive-match bug those fixes targeted wasn't the
+    // whole story; this is a separate, second bug in the same area.
+    // Fixed by preserving these three STREAMINFO-sourced fields across the
+    // reset instead of wiping them -- they're real file-level properties
+    // that don't change mid-file, so carrying them forward is correct
+    // whether this reset came from a seek, a loop-to-start, or an ordinary
+    // mid-stream resync. The very first reset ever for a file (before
+    // STREAMINFO has even been parsed) just preserves 0->0, a no-op --
+    // read_FLAC_Header() unconditionally overwrites these three fields
+    // with the real values right after, unaffected by this change.
+    uint8_t  savedChannels = 0, savedBitsPerSample = 0;
+    uint32_t savedSampleRate = 0;
+    if(FLACMetadataBlock) {
+        savedChannels = FLACMetadataBlock->numChannels;
+        savedSampleRate = FLACMetadataBlock->sampleRate;
+        savedBitsPerSample = FLACMetadataBlock->bitsPerSample;
+    }
     FLACDecoder_setDefaults();
     FLACDecoder_ClearBuffer();
+    if(FLACMetadataBlock) {
+        FLACMetadataBlock->numChannels = savedChannels;
+        FLACMetadataBlock->sampleRate = savedSampleRate;
+        FLACMetadataBlock->bitsPerSample = savedBitsPerSample;
+    }
 }
 //----------------------------------------------------------------------------------------------------------------------
 // Same frame-header CRC-8 verification as Audio.cpp's
