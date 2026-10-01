@@ -1560,9 +1560,24 @@ int Audio::read_FLAC_Header(uint8_t* data, size_t len) {
         if(m_flacMaxFrameSize) { AUDIO_INFO("FLAC maxFrameSize: %u", m_flacMaxFrameSize); }
         else { AUDIO_INFO("FLAC maxFrameSize: N/A"); }
         if(m_flacMaxFrameSize > InBuff.getMaxBlockSize()) {
-            log_e("FLAC maxFrameSize too large!");
-            stopSong();
-            return -1;
+            // clickpod patch: grow the buffer to fit this file's real max
+            // frame size instead of refusing to play it. m_flacMaxFrameSize
+            // is a uint16_t (see Audio.h), so it can never exceed 65535
+            // regardless of what a file's STREAMINFO claims -- no separate
+            // cap needed beyond the nonzero check. Real-hardware confirmed:
+            // fixes every "FLAC maxFrameSize too large!" skip clickpod was
+            // hitting on its pinned 3.0.12 build. See
+            // github.com/ismail3005/clickpod's CLAUDE.md for the full
+            // writeup (this started as a build-time string-patch there
+            // before being committed here directly).
+            if(m_flacMaxFrameSize > 0) {
+                InBuff.changeMaxBlockSize(m_flacMaxFrameSize);
+                AUDIO_INFO("FLAC maxFrameSize %u exceeds default buffer, resized to fit", m_flacMaxFrameSize);
+            } else {
+                log_e("FLAC maxFrameSize too large!");
+                stopSong();
+                return -1;
+            }
         }
         //        InBuff.changeMaxBlockSize(m_flacMaxFrameSize);
         vTaskDelay(2);
