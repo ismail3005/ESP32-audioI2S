@@ -170,6 +170,22 @@ const uint32_t mask[] = {0x00000000, 0x00000001, 0x00000003, 0x00000007, 0x00000
                          0x0fffffff, 0x1fffffff, 0x3fffffff, 0x7fffffff, 0xffffffff};
 
 uint32_t readUint(uint8_t nBits, int32_t *bytesLeft){
+    // clickpod patch, round 2: readUint() being CALLED AGAIN after
+    // s_f_bitReaderError is already set (see readRiceSignedInt() below)
+    // used to re-enter the while loop, re-check *bytesLeft, and re-log
+    // "error in bitreader" every single time -- with s_flacBitBufferLen
+    // left untouched by the round-1 fix (correctly, to avoid the
+    // uint8_t-underflow corruption that fix targeted), the loop
+    // condition `s_flacBitBufferLen < nBits` stays true forever, so
+    // every call keeps hitting the same break and returning 0 -- a
+    // REAL hang, confirmed on real hardware (a scrub back on a track
+    // froze the device solid, log spammed with this exact line
+    // thousands of times a second). Checking the sticky flag FIRST and
+    // returning immediately stops the re-entry/re-log; the loop at the
+    // call site (readRiceSignedInt()) also needed its own fix, since an
+    // endless readUint()==0 is indistinguishable from legitimate unary-
+    // coded zero bits from in there alone -- see that function.
+    if (s_f_bitReaderError) return 0;
     // clickpod patch: two real bugs fixed here, found tracing a real
     // heap-corruption crash (Guru Meditation StoreProhibited inside an
     // unrelated malloc(), minutes after "readUint(): error in bitreader"
@@ -219,9 +235,21 @@ int32_t readSignedInt(int32_t nBits, int32_t* bytesLeft){
 }
 
 int64_t readRiceSignedInt(uint8_t param, int32_t* bytesLeft){
+    // clickpod patch, round 2: this unary-coded run (a string of 0 bits
+    // terminated by a 1) has no bound of its own -- it trusts readUint()
+    // to eventually return nonzero. Once the bit reader has genuinely
+    // run out of input (s_f_bitReaderError), readUint() can only ever
+    // return 0 again (see its own patch above), so without this check
+    // the loop never terminates -- a real, confirmed hang, not a
+    // hypothetical. Bailing out the instant the flag is set is what
+    // actually stops it; the caller chain already discards the whole
+    // frame on s_f_bitReaderError (see decodeResidual()), so the exact
+    // `val` returned here on the error path is never used for real
+    // output.
     long val = 0;
-    while (readUint(1, bytesLeft) == 0)
+    while (!s_f_bitReaderError && readUint(1, bytesLeft) == 0)
         val++;
+    if (s_f_bitReaderError) return 0;
     val = (val << param) | readUint(param, bytesLeft);
     return (val >> 1) ^ -(val & 1);
 }
@@ -1097,7 +1125,13 @@ int8_t decodeSubframe(uint8_t sampleDepth, uint8_t ch, int32_t* bytesLeft) {
                                            // 0 : no wasted bits-per-sample in source subblock, k=0
                                            // 1 : k wasted bits-per-sample in source subblock, k-1 follows, unary coded; e.g. k=3 => 001 follows, k=7 => 0000001 follows.
     if (shift == 1) {
-        while (readUint(1, bytesLeft) == 0) { shift++;}
+        // clickpod patch, round 2: same unbounded-unary-read hang as
+        // readRiceSignedInt() above (see that function's comment) --
+        // once the bit reader has genuinely run out of input,
+        // readUint() can only return 0 forever, so this loop needs its
+        // own bailout too, not just the one inside readRiceSignedInt().
+        while (!s_f_bitReaderError && readUint(1, bytesLeft) == 0) { shift++; }
+        if (s_f_bitReaderError) return ERR_FLAC_BITREADER_UNDERFLOW;
     }
     sampleDepth -= shift;
 
