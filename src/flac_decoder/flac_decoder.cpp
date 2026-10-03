@@ -410,8 +410,30 @@ int32_t FLACFindSyncWord(unsigned char *buf, int32_t nBytes) {
         for (i = 0; i < nBytes - 1; i++) {
             if ((buf[i + 0] & 0xFF) == 0xFF  && (buf[i + 1] & 0xFC) == 0xF8) { // <14> Sync code '11111111111110xx'
                 if(flacTryParseFrameHeader(buf + i, nBytes - i) < 0) continue; // false positive, keep scanning
-                if(i) FLACDecoderReset();
-            //    s_f_bitReaderError = false;
+                // CONFIRMED BUG, FIXED: this used to be `if(i) FLACDecoderReset();`
+                // -- skipping the reset whenever the verified sync word happened
+                // to land at the very start of the buffer (i==0), on the mistaken
+                // assumption that "no bytes to skip" also meant "no decoder state
+                // to reset." It doesn't: this function only runs after something
+                // already went wrong (a decode error set m_f_playing=false and
+                // asked for a resync) and s_offset/s_blockSize/s_flacStatus may
+                // still hold a PARTIAL in-progress frame's state regardless of
+                // where the next valid header happens to be found. Landing at
+                // i==0 is common (a decode error often leaves the stream
+                // pointer already right at the next frame boundary) and this
+                // gap left stale state -- most dangerously a stale, nonzero
+                // s_offset carried into a new frame with a different s_blockSize
+                // -- which underflows the uint16_t subtraction at
+                // `blockSize = s_blockSize - s_offset` in FLACDecodeNative()'s
+                // OUT_SAMPLES block, producing a huge garbage loop bound that
+                // reads s_samplesBuffer[j][i + s_offset] wildly out of bounds.
+                // Confirmed as the real cause of a crash reading a garbage
+                // pointer from that exact line, logged right after two resyncs
+                // in a row where the second one found sync at pos 0. Always
+                // resetting here, regardless of i, is correct: a verified sync
+                // word being found at all means a fresh frame boundary is being
+                // declared, which always needs fresh decoder state.
+                FLACDecoderReset();
                 return i;
             }
         }
