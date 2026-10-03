@@ -170,14 +170,41 @@ const uint32_t mask[] = {0x00000000, 0x00000001, 0x00000003, 0x00000007, 0x00000
                          0x0fffffff, 0x1fffffff, 0x3fffffff, 0x7fffffff, 0xffffffff};
 
 uint32_t readUint(uint8_t nBits, int32_t *bytesLeft){
+    // clickpod patch: two real bugs fixed here, found tracing a real
+    // heap-corruption crash (Guru Meditation StoreProhibited inside an
+    // unrelated malloc(), minutes after "readUint(): error in bitreader"
+    // logged during a fast-scrub session) -- see clickpod's CLAUDE.md.
+    // 1) The old loop read *(s_flacInptr + s_rIndex) and incremented
+    //    s_rIndex/decremented *bytesLeft BEFORE checking whether a byte
+    //    was actually available -- a real one-byte-past-the-end READ on
+    //    every underflow. Now checked BEFORE reading.
+    // 2) Worse: on that error path the old code still fell through to
+    //    `s_flacBitBufferLen -= nBits` unconditionally, even though the
+    //    loop broke out early having accumulated FEWER than nBits bits.
+    //    s_flacBitBufferLen is a uint8_t -- subtracting more than it
+    //    currently holds underflows it to a huge garbage value (e.g.
+    //    0 - 7 wraps to 249), which then persists as global decoder
+    //    state into every SUBSEQUENT readUint() call (shifting a
+    //    uint64_t by a bit-length >= 64 is undefined behavior on top of
+    //    that). That garbage propagates into decoded block
+    //    sizes/sample counts/coefficients -- exactly the kind of value
+    //    that can later drive an out-of-bounds WRITE into a PCM output
+    //    buffer, corrupting the heap (the actual crash's signature:
+    //    the panic hit later, inside an unrelated malloc(), not here).
+    //    Returning immediately on error, before touching
+    //    s_flacBitBufferLen, stops the corruption at its real source --
+    //    every caller already checks s_f_bitReaderError right after
+    //    (see decodeResidual()) and discards the frame, so a dummy 0
+    //    return here is never actually used for real decode output.
     while (s_flacBitBufferLen < nBits){
+        if (*bytesLeft <= 0) { log_e("error in bitreader"); s_f_bitReaderError = true; break; }
         uint8_t temp = *(s_flacInptr + s_rIndex);
         s_rIndex++;
         (*bytesLeft)--;
-        if(*bytesLeft < 0) { log_e("error in bitreader"); s_f_bitReaderError = true; break;}
         s_flac_bitBuffer = (s_flac_bitBuffer << 8) | temp;
         s_flacBitBufferLen += 8;
     }
+    if (s_f_bitReaderError) return 0;
     s_flacBitBufferLen -= nBits;
     uint32_t result = s_flac_bitBuffer >> s_flacBitBufferLen;
     if (nBits < 32)
