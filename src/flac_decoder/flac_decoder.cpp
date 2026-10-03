@@ -1013,9 +1013,25 @@ int8_t flacDecodeFrame(uint8_t *inbuf, int32_t *bytesLeft){
     else{
         return ERR_FLAC_RESERVED_BLOCKSIZE_UNSUPPORTED;
     }
-    uint16_t maxBS = 8192;
-    if(psramFound()) maxBS = 8192 * 4;
-    if(s_blockSize > maxBS){
+    // CONFIRMED HEAP OVERFLOW, FIXED: this used to allow s_blockSize up to
+    // 8192*4 (32768) whenever PSRAM is present, but s_samplesBuffer[] (see
+    // FLACDecoder_AllocateBuffers() above) is ALWAYS allocated at exactly
+    // s_maxBlocksize (== MAX_BLOCKSIZE == 8192) ints per channel, regardless
+    // of PSRAM -- PSRAM only changes WHERE that buffer lives (ps_malloc vs
+    // malloc), never how big it is. A frame whose decoded block size landed
+    // between 8193 and 32768 -- genuine, or a false-positive resync accept
+    // from FLACFindSyncWord()/flac_correctResumeFilePos() -- passed this
+    // check and then overflowed s_samplesBuffer by up to 4x during
+    // decodeSubframes()'s per-sample writes and the OUT_SAMPLES copy loop
+    // below, corrupting whatever heap memory happened to sit after it.
+    // This is the real root cause of the clickpod heap-corruption crashes
+    // (a BT SBC-encoder allocator crash, and a Track/String copy-ctor
+    // crash) traced back to this file -- not a guess, confirmed by reading
+    // the actual allocation size next to this check. Bounding against the
+    // buffer's REAL, fixed capacity instead of a PSRAM-presence guess
+    // closes the overflow regardless of what produced the oversized
+    // s_blockSize in the first place.
+    if(s_blockSize > s_maxBlocksize){
         log_e("Error: blockSize too big ,%i bytes", s_blockSize);
         return ERR_FLAC_BLOCKSIZE_TOO_BIG;
     }
