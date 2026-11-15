@@ -60,6 +60,18 @@ size_t AudioBuffer::init() {
 }
 
 void AudioBuffer::changeMaxBlockSize(uint16_t mbs) {
+    // clickpod: getReadPtr() copies up to m_maxBlockSize bytes of wrapped-
+    // around data into the reserve area that sits AFTER m_endPtr (that is
+    // what lets the decoder always see one contiguous block). The reserve
+    // only has (resBuffSize - 1) bytes, so a block size bigger than that
+    // makes getReadPtr() memcpy past the end of the whole allocation --
+    // a real heap overflow, see the comment on m_resBuffSizePSRAM in
+    // Audio.h. Never let the block size outgrow the reserve.
+    size_t res = m_f_psram ? m_resBuffSizePSRAM : m_resBuffSizeRAM;
+    if(m_f_init && res > 1 && mbs > res - 1) {
+        log_e("maxBlockSize %u exceeds the buffer's reserve (%u), clamped", mbs, (unsigned)(res - 1));
+        mbs = (uint16_t)(res - 1);
+    }
     m_maxBlockSize = mbs;
     return;
 }
@@ -160,13 +172,24 @@ uint8_t* AudioBuffer::getReadPtr() {
 }
 
 void AudioBuffer::resetBuffer() {
+    // clickpod: this used to vSemaphoreDelete(mutex_buffer) and create a
+    // fresh one ("free semaphore if it is set"). resetBuffer() runs on the
+    // Arduino loop task (every seek, via processLocalFile()) while the
+    // decode task can be inside bufferFilled()/getReadPtr()/bytesWasRead()
+    // HOLDING that very mutex, or blocked on it -- deleting a FreeRTOS
+    // mutex out from under another task frees memory that task then gives
+    // back / takes again. That is a use-after-free on the heap and on the
+    // queue's own spinlock (seen in the field as heap-corruption panics and
+    // `assert failed: spinlock_acquire` right after scrubbing). Just take
+    // the mutex like every other accessor instead; it is recursive and is
+    // never left held across calls, so there is nothing to "free".
+    xSemaphoreTakeRecursive(mutex_buffer, 3 * configTICK_RATE_HZ);
     m_writePtr = m_buffer;
     m_readPtr = m_buffer;
     m_endPtr = m_buffer + m_buffSize;
     m_f_start = true;
     // memset(m_buffer, 0, m_buffSize); //Clear Inputbuffer
-    vSemaphoreDelete(mutex_buffer);
-    mutex_buffer = xSemaphoreCreateRecursiveMutex(); // free semaphore is it set
+    xSemaphoreGiveRecursive(mutex_buffer);
 }
 
 uint32_t AudioBuffer::getWritePos() { return m_writePtr - m_buffer; }
@@ -3266,13 +3289,28 @@ void Audio::processLocalFile() {
         if(m_codec == CODEC_FLAC) {
             m_resumeFilePos = flac_correctResumeFilePos(m_resumeFilePos);
             if(m_resumeFilePos == -1) goto exit;
-            FLACDecoderReset();
         }
         if(m_codec == CODEC_MP3) {
             m_resumeFilePos = mp3_correctResumeFilePos(m_resumeFilePos);
             if(m_resumeFilePos == -1) goto exit;
         }
 
+        // clickpod: everything below rewinds state the DECODE TASK is
+        // actively using (performAudioTask() -> playAudioData(), which holds
+        // mutex_playAudioData for the whole decode + output of one frame):
+        // FLACDecoderReset() zeroes the decoder's frame state (s_offset,
+        // block size, ...) and InBuff.resetBuffer() rewinds the very buffer
+        // it is reading a frame out of. This runs on the Arduino loop task,
+        // and used to do so with no lock at all -- so a seek landing while
+        // the other task was mid-frame decoded the rest of that frame
+        // against wiped state and a rewound buffer (out-of-bounds sample
+        // writes/reads; the crashes seen while scrubbing). Take the same
+        // mutex connecttoFS()/pauseResume() already take, so the decode
+        // task is never inside a frame while this happens. Setting
+        // m_f_stream=false inside the lock also means it will not start
+        // another frame until the buffer has been refilled.
+        xSemaphoreTake(mutex_playAudioData, portMAX_DELAY);
+        if(m_codec == CODEC_FLAC) FLACDecoderReset();
         audiofile.seek(m_resumeFilePos);
         InBuff.resetBuffer();
         byteCounter = m_resumeFilePos;
@@ -3280,6 +3318,8 @@ void Audio::processLocalFile() {
 
         m_resumeFilePos = -1;
         m_f_stream = false;
+        m_validSamples = 0;
+        xSemaphoreGive(mutex_playAudioData);
     }
     // end of file reached? - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     if(f_fileDataComplete && InBuff.bufferFilled() < InBuff.getMaxBlockSize()) {
@@ -3301,12 +3341,22 @@ void Audio::processLocalFile() {
             return;
         } // loop
 exit:
+        // clickpod: same race as the seek path above, and worse -- this
+        // FREES the decoder's buffers. The decode task only checks
+        // m_f_running at the top of performAudioTask(); if it is already
+        // inside playAudioData() (finishing a frame / pushing samples out)
+        // when the loop task gets here, the buffers it is using would be
+        // freed underneath it and whatever is allocated next lands on top
+        // of memory it is still writing. Hold mutex_playAudioData across
+        // the teardown: m_f_running goes false inside the lock, so the
+        // decode task cannot be mid-frame now and will not start another.
+        xSemaphoreTake(mutex_playAudioData, portMAX_DELAY);
         char* afn = NULL;
         if(audiofile) afn = strdup(audiofile.name()); // store temporary the name
         m_f_running = false;
         m_streamType = ST_NONE;
         audiofile.close();
-        AUDIO_INFO("Closing audio file \"%s\"", afn);
+        AUDIO_INFO("Closing audio file \"%s\"", afn ? afn : "");
 
         if(m_codec == CODEC_MP3) MP3Decoder_FreeBuffers();
         if(m_codec == CODEC_AAC) AACDecoder_FreeBuffers();
@@ -3314,6 +3364,8 @@ exit:
         if(m_codec == CODEC_FLAC) FLACDecoder_FreeBuffers();
         if(m_codec == CODEC_OPUS) OPUSDecoder_FreeBuffers();
         if(m_codec == CODEC_VORBIS) VORBISDecoder_FreeBuffers();
+        m_validSamples = 0;
+        xSemaphoreGive(mutex_playAudioData);
 
         if(afn) {
             if(audio_eof_mp3) audio_eof_mp3(afn);
@@ -4987,10 +5039,16 @@ bool Audio::setFilePos(uint32_t pos) {
     if(!audiofile) return false;
     if(m_codec == CODEC_OPUS) return false;   // not impl. yet
     if(m_codec == CODEC_VORBIS) return false; // not impl. yet
+    // clickpod: m_outBuff/m_validSamples belong to the decode task while it
+    // is inside playAudioData() (playChunk() is walking m_outBuff by
+    // m_validSamples) -- only touch them with it parked, same mutex as
+    // connecttoFS()/pauseResume().
+    xSemaphoreTake(mutex_playAudioData, portMAX_DELAY);
     memset(m_outBuff, 0, m_outbuffSize);
     m_validSamples = 0;
     m_resumeFilePos = pos;  // used in processLocalFile()
     m_haveNewFilePos = pos; // used in computeAudioCurrentTime()
+    xSemaphoreGive(mutex_playAudioData);
 
     return true;
 }
@@ -6429,7 +6487,11 @@ void Audio::startAudioTask() {
         return;
     }
     m_f_audioTaskIsRunning = true;
-    xTaskCreate(&Audio::taskWrapper, "PeriodicTask", 3300, this, 4, &m_audioTaskHandle);
+    // clickpod: 3300 -> 4608 bytes. This task runs the whole decode path AND
+    // (clickpod) the audio_process_i2s() hook that feeds Bluetooth, plus the
+    // logging both do on error/resync paths; 3300 was sized for the plain
+    // I2S-only case. Cheap headroom, not a measured requirement.
+    xTaskCreate(&Audio::taskWrapper, "PeriodicTask", 4608, this, 4, &m_audioTaskHandle);
 }
 
 void Audio::stopAudioTask()  {

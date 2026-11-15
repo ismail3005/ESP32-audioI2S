@@ -113,7 +113,20 @@ protected:
     size_t            m_writeSpace       = 0;
     size_t            m_dataLength       = 0;
     size_t            m_resBuffSizeRAM   = 2048;     // reserved buffspace, >= one wav  frame
-    size_t            m_resBuffSizePSRAM = 4096 * 4; // reserved buffspace, >= one flac frame
+    // clickpod: was 4096 * 4 (16384). getReadPtr() copies up to m_maxBlockSize
+    // bytes of wrapped-around data into this reserve area (it sits right
+    // after m_endPtr, at the very end of the allocation), so the reserve
+    // has to be at least as big as the largest block size ever set. The
+    // clickpod fork grows the FLAC block size to the file's real max frame
+    // size (read_FLAC_Header(), a uint16 -> up to 65535) so files with
+    // frames over 16384 bytes play at all -- but with a 16384-byte reserve
+    // that made getReadPtr() memcpy up to ~49KB PAST THE END of the PSRAM
+    // allocation every time the read pointer came round to the end of the
+    // ring with such a file playing: silent heap corruption that surfaced
+    // later as unrelated-looking panics (bad heap tail, tlsf free-list
+    // faults, corrupted Strings). 65536 + slack covers any uint16 block
+    // size; AudioBuffer::changeMaxBlockSize() also clamps to it now.
+    size_t            m_resBuffSizePSRAM = 65536 + 64; // reserved buffspace, >= the largest possible flac frame
     size_t            m_maxBlockSize     = 1600;
     uint8_t*          m_buffer           = NULL;
     uint8_t*          m_writePtr         = NULL;
