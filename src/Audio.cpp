@@ -3209,7 +3209,13 @@ void Audio::processLocalFile() {
         return;
     }
 
-    availableBytes = 256 * 1024; // set some large value
+    // clickpod: was 256 * 1024 ("some large value"). This is how much is read
+    // from SD in ONE loop() call, on the caller's (UI) task. Filling the
+    // input buffer at the start of a file or after a seek in 256KB gulps
+    // froze the caller for a few hundred ms at a time -- long enough for a
+    // quick button press to come and go unseen. 32KB keeps each call short;
+    // the buffer fills just as fast overall, across more calls.
+    availableBytes = 32 * 1024;
 
     availableBytes = min(availableBytes, (uint32_t)InBuff.writeSpace());
     availableBytes = min(availableBytes, audiofile.size() - byteCounter);
